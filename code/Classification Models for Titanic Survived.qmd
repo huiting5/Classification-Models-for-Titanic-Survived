@@ -1,0 +1,479 @@
+---
+title: "Classification Models for Titanic Survived"
+author: "Huiting Wu"
+date: "February 27, 2025"
+format: 
+  html:
+    embed-resources: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+library(pacman)
+p_load(tidymodels, ggplot2, parnip, glmnet, randomForest, kknn, C50, workflow, recipes, naivebayes, titanic, discrim, stringr, forcats)
+```
+
+The 5 steps of Machine learning are: 
+
+1. Develop a research question: Clearly identify the questions and decide what data to collect for the research question.
+
+2. Reading the data set into a software: Method to read a data set depends on what software language to be used and what kind of the data set it is.
+
+3. Explore the data: Explore the missing values, outliers. Visualize the data. Summary or statistic of the data.
+
+4. Specify models: Split the data into training and testing. Train appropriate models with the training data. 
+
+5. Evaluate and improve models: Evaluate the model with the test data. Using accuracy, ROC, AUC, confusion matrix, MSE, MAE, etc... to evaluate the performance of the models. Use parameter tuning to improve the models.
+
+# Titanic dataset
+
+For the [titanic](https://www.kaggle.com/c/titanic/data) data set try the following machine learning classification algorithms.
+
+Build **classification models** for the *Survived* variable.
+
+0. Null Model
+1. kNN (the sample code given did not scale or normalize, if you use this model you need to do that.)
+2. Boosted C5.0 
+3. Random Forest
+4. Logistic Regression using regularization
+5. Naive Bayes
+
+```{r, eval = FALSE}
+data(titanic_train)
+data(titanic_test)
+
+head(titanic_train)
+head(titanic_test)
+```
+
+
+# Model 0 Null Model
+
+
+```{r}
+# split the titanic_train into training and testing data
+set.seed(652)
+split <- titanic_train |> 
+  select(-PassengerId, -Cabin) |> 
+  mutate(Survived = as.factor(if_else(Survived == 1, "yes", "no"))) |> 
+  mutate(title = str_extract(Name, "[A-Za-z]+\\."),
+           title = fct_lump(title, 4),
+    Survived = relevel(Survived, ref = "yes"),
+    class = case_when(Pclass == 1 ~ "first",
+                             Pclass == 2 ~ "second",
+                             Pclass == 3 ~ "third"),
+         class = as.factor(class),
+    ticketfreq = ave(1:nrow(titanic_train), FUN = length),
+           fareadjusted = Fare / ticketfreq) |> 
+  select(-Name, -Ticket) |> 
+  initial_split(prop = 0.75)
+
+# impute the missing value
+# missing value of Age == median
+# missing value of Embarked == mode "S"
+train <- split |> training()
+train <- train |> 
+  mutate(Sex = as.factor(Sex),
+         Age = if_else(is.na(Age), median(Age, na.rm = T), Age),
+         Embarked = if_else(Embarked == "", "S", Embarked),
+         Embarked = as.factor(Embarked))
+
+test <- split |> testing()
+test <- test |> 
+  mutate(Sex = as.factor(Sex),
+         Age = if_else(is.na(Age), median(Age, na.rm = T), Age),
+         Embarked = if_else(Embarked == "", "S", Embarked), 
+         Embarked = as.factor(Embarked))
+```
+
+```{r}
+# fit into null model
+null <- logistic_reg(mode = "classification") |> 
+  set_engine("glm") |> 
+  fit(Survived ~ 1, data = train)
+
+# predict the test data with null model
+pred_null <- predict(null, new_data = test, type = "class") |> 
+  bind_cols(test)
+
+# confusion matrix
+pred_null |> conf_mat(truth = Survived, estimate = .pred_class)
+                   
+# accuracy
+pred_null |> accuracy(truth = Survived, estimate = .pred_class)
+
+# roc_auc
+pred_null <- predict(null, new_data = test, type = "prob") |> 
+  bind_cols(test)
+pred_null |> roc_auc(truth = Survived, .pred_yes)
+```
+
+# Model 1 kNN
+
+
+```{r}
+# convert sex and embarked into numeric
+train_knn <- train |> 
+  mutate(sex_recode = if_else(Sex == "male", 1, 0),
+         embarked_recode = recode(Embarked, "S" = 1, "C" = 2, "Q" = 3)) |> 
+  select(-Sex, -Embarked, -class, -title)
+
+test_knn <- test |> 
+  mutate(sex_recode = if_else(Sex == "male", 1, 0),
+         embarked_recode = recode(Embarked, "S" = 1, "C" = 2, "Q" = 3)) |> 
+  select(-Sex, -Embarked, -class, -title)
+
+# KNN model
+model_knn <- nearest_neighbor(neighbors = tune()) |> 
+  set_engine("kknn") |> 
+  set_mode("classification")
+
+# Create workflow
+knn_recipe <- recipe(Survived ~ ., data = train_knn) |> 
+  step_normalize(all_numeric(), -all_outcomes())
+
+knn_workflow <- workflow() |> 
+  add_recipe(knn_recipe) |> 
+  add_model(model_knn)
+
+# Select best k
+knn_grid <- grid_regular(neighbors(range = c(1, 50)), levels = 10)
+set.seed(652)
+knn_res <- tune_grid(
+  knn_workflow,
+  resamples = vfold_cv(train_knn, v = 5, strata = Survived),
+  grid = knn_grid,
+  control = control_grid(save_pred = TRUE),
+  metrics = metric_set(roc_auc)
+)
+
+knn_best <- knn_res |> select_best(metric = "roc_auc")
+knn_best
+
+# fit the best model
+wf_knn <- knn_workflow |> finalize_workflow(knn_best)
+knn_fit <- wf_knn |> fit(data = train_knn)
+
+# predict knn model with the test data
+pred_knn <- predict(knn_fit, new_data = test_knn, type = "class") |> 
+  bind_cols(test_knn)
+
+# confusion matrix
+pred_knn |> conf_mat(truth = Survived, estimate = .pred_class)
+
+# accuracy
+pred_knn |> accuracy(truth = Survived, estimate = .pred_class)
+
+# roc_auc
+pred_knn <- predict(knn_fit, new_data = test_knn, type = "prob") |> 
+  bind_cols(test_knn)
+pred_knn |> roc_auc(truth = Survived, .pred_yes)
+```
+
+# Model 2 Boosted C5.0
+
+
+```{r}
+recipe <- recipe(Survived ~., data = train) |> 
+  step_dummy(all_nominal(), -all_outcomes())
+
+# boosted C5.0 model
+model_c50 <- boost_tree(
+  trees = tune(),
+  min_n = tune(),
+  mode = "classification") |> 
+  set_engine("C5.0")
+
+# create a workflow
+c50_workflow <- workflow() |> 
+  add_recipe(recipe) |> 
+  add_model(model_c50)
+
+# find the best tunning parameters
+set.seed(652)
+cv_folds <- vfold_cv(train, v = 5, strata = Survived)
+c50_res <- 
+  c50_workflow |> 
+  tune_grid(resamples = cv_folds,
+            grid = 25,
+            control = control_grid(save_pred = TRUE),
+            metrics = metric_set(roc_auc))
+
+c50_best <- c50_res |> select_best(metric = "roc_auc")
+c50_best
+
+# fit the best model
+wf_c50 <- c50_workflow |> finalize_workflow(c50_best)
+c50_fit <- wf_c50 |> fit(data = train)
+
+# predict the model
+pred_c50 <- predict(c50_fit, new_data = test, type = "class") |> 
+  bind_cols(test)
+
+# confusion matrix
+pred_c50 |> conf_mat(truth = Survived, estimate = .pred_class)
+
+# accuracy
+pred_c50 |> accuracy(truth = Survived, estimate = .pred_class)
+
+# roc_auc
+pred_c50 <- predict(c50_fit, new_data = test, type = "prob") |> 
+  bind_cols(test)
+pred_c50 |> roc_auc(truth = Survived, .pred_yes)
+```
+
+# Model 3 Random Forest
+
+
+```{r}
+# random forest model
+model_rf <- rand_forest(mtry = tune(),
+                        min_n = tune(),
+                        trees = tune()) |> 
+  set_engine("randomForest") |> 
+  set_mode("classification")
+
+# create a workflow
+rf_workflow <- workflow() |> 
+  add_recipe(recipe) |> 
+  add_model(model_rf)
+
+# find the best tunning parameters
+rf_grid <- grid_latin_hypercube(
+  finalize(mtry(), train),
+  min_n(),
+  trees(),
+  size = 25 
+)
+
+set.seed(652)
+rf_res <- 
+  rf_workflow |> 
+  tune_grid(resamples = cv_folds,
+            grid = rf_grid,
+            control = control_grid(save_pred = TRUE),
+            metrics = metric_set(roc_auc))
+
+rf_best <- rf_res |> select_best(metric = "roc_auc")
+rf_best 
+
+# fit the best model
+wf_rf <- rf_workflow |> finalize_workflow(rf_best)
+rf_fit <- wf_rf |> fit(data = train)
+
+# predict the model
+pred_rf <- predict(rf_fit, new_data = test, type = "class") |> 
+  bind_cols(test)
+
+# confusion matrix
+pred_rf |> conf_mat(truth = Survived, estimate = .pred_class)
+
+# accuracy
+pred_rf |> accuracy(truth = Survived, estimate = .pred_class)
+
+# roc_auc
+pred_rf <- predict(rf_fit, new_data = test, type = "prob") |> 
+  bind_cols(test)
+pred_rf |> roc_auc(truth = Survived, .pred_yes)
+```
+
+# Model 4 Logistic Regression using regularization
+
+```{r}
+# logistic regression
+logistic_reg <- logistic_reg(mode = "classification", 
+                             penalty = tune(), 
+                             mixture = 1) |>
+  set_engine("glmnet")
+
+# create a workflow
+lr_workflow <- workflow() |> 
+  add_recipe(recipe) |> 
+  add_model(logistic_reg)
+
+# find the best tunning parameters
+lr_grid <- grid_regular(penalty(), levels = 15)
+
+set.seed(652)
+lr_res <- 
+  lr_workflow |> 
+  tune_grid(resamples = cv_folds,
+            grid = lr_grid,
+            control = control_grid(save_pred = TRUE),
+            metrics = metric_set(roc_auc))
+
+lr_best <- lr_res |> select_best(metric = "roc_auc")
+lr_best
+
+# fit the best model
+wf_lr <- lr_workflow |> finalize_workflow(lr_best)
+lr_fit <- wf_lr |> fit(data = train)
+
+# predict the model
+pred_rf <- predict(lr_fit, new_data = test, type = "class") |> 
+  bind_cols(test)
+
+# confusion matrix
+pred_rf |> conf_mat(truth = Survived, estimate = .pred_class)
+
+# accuracy
+pred_rf |> accuracy(truth = Survived, estimate = .pred_class)
+
+# roc_auc
+pred_lr <- predict(lr_fit, new_data = test, type = "prob") |> 
+  bind_cols(test)
+pred_lr |> roc_auc(truth = Survived, .pred_yes)
+```
+
+# Model 5 Naive Bayes
+
+```{r}
+# navie bayes model
+model_nb <- naive_Bayes(smoothness = tune(), Laplace = tune()) |> 
+  set_engine("naivebayes") |> 
+  set_mode("classification")
+
+# create a workflow
+nb_workflow <- workflow() |> 
+  add_recipe(recipe) |> 
+  add_model(model_nb)
+
+# find the best tunning parameters
+set.seed(652)
+nb_res <- 
+  nb_workflow |> 
+  tune_grid(resamples = cv_folds,
+            grid = 15,
+            control = control_grid(save_pred = TRUE),
+            metrics = metric_set(roc_auc))
+
+nb_best <- nb_res |> select_best(metric = "roc_auc")
+nb_best
+
+# fit the best model
+wf_nb <- nb_workflow |> finalize_workflow(nb_best)
+nb_fit <- wf_nb |> fit(data = train)
+
+# predict the model
+pred_nb <- predict(nb_fit, new_data = test, type = "class") |> 
+  bind_cols(test)
+
+# confusion matrix
+pred_nb |> conf_mat(truth = Survived, estimate = .pred_class)
+
+# accuracy
+pred_nb |> accuracy(truth = Survived, estimate = .pred_class)
+
+# roc_auc
+pred_nb <- predict(nb_fit, new_data = test, type = "prob") |> 
+  bind_cols(test)
+pred_nb |> roc_auc(truth = Survived, .pred_yes)
+```
+
+# ROC Curve
+
+```{r}
+# prediction probabilities
+
+## null model
+pred_null <- predict(null, new_data = test, type = "prob") |> 
+  bind_cols(test |> select(Survived)) |> 
+  mutate(model = "Null Model")
+
+## knn
+pred_knn <- predict(knn_fit, new_data = test_knn, type = "prob") |> 
+  bind_cols(test_knn |> select(Survived)) |> 
+  mutate(model = "KNN")
+
+## boosted c5.0
+pred_c50 <- predict(c50_fit, new_data = test, type = "prob") |> 
+  bind_cols(test |> select(Survived)) |> 
+  mutate(model = "Boosted C5.0")
+
+## random forest
+pred_rf <- predict(rf_fit, new_data = test, type = "prob") |> 
+  bind_cols(test |> select(Survived)) |> 
+  mutate(model = "Random Forest")
+
+## logstic regression
+pred_lr <- predict(lr_fit, new_data = test, type = "prob") |> 
+  bind_cols(test |> select(Survived)) |> 
+  mutate(model = "Logistic Regression")
+
+## naive bayes
+pred_nb <- predict(nb_fit, new_data = test, type = "prob") |> 
+  bind_cols(test |> select(Survived)) |> 
+  mutate(model = "Naive Bayes")
+
+# Combine all predictions
+all_preds <- bind_rows(pred_null, pred_knn, 
+                       pred_c50, pred_rf, 
+                       pred_lr, pred_nb)
+
+# Compute ROC curves
+roc_curves <- all_preds |> 
+  group_by(model) |> 
+  roc_curve(Survived, .pred_yes) 
+
+# Plot ROC curves
+ggplot(roc_curves, aes(x = 1 - specificity, 
+                       y = sensitivity, color = model)) +
+  geom_line() +
+  labs(title = "ROC Curve Comparison") +
+  theme_minimal()
+```
+
+# Best Model
+
+```{r}
+# Re-run best model on the full titanic_train dataset
+titanic_train <- titanic_train |> 
+  select(-Cabin, -Name, -Ticket) |> 
+  mutate(Survived = as.factor(Survived)) |> 
+  mutate(Survived = relevel(Survived, ref = "1"),
+         class = case_when(Pclass == 1 ~ "first",
+                             Pclass == 2 ~ "second",
+                             Pclass == 3 ~ "third"),
+         class = as.factor(class)) |> 
+  mutate(Sex = as.factor(Sex),
+         Age = if_else(is.na(Age), median(Age, na.rm = T), Age),
+         Embarked = if_else(Embarked == "", "S", Embarked),
+         Embarked = as.factor(Embarked))
+
+model_c50 <- boost_tree(
+  trees = 34,
+  min_n = 3,
+  mode = "classification") |> 
+  set_engine("C5.0") |> 
+  fit(Survived ~., data = titanic_train)
+```
+
+```{r}
+# produce predictions for the titanic_test dataset
+titanic_test <- titanic_test |> 
+  select(-Cabin, -Name, -Ticket) |> 
+  mutate(class = case_when(Pclass == 1 ~ "first",
+                             Pclass == 2 ~ "second",
+                             Pclass == 3 ~ "third"),
+         class = as.factor(class),
+         Sex = as.factor(Sex),
+         Age = if_else(is.na(Age), median(Age, na.rm = T), Age),
+         Fare = if_else(is.na(Fare), median(Fare, na.rm = T), Fare),
+         Embarked = if_else(Embarked == "", "S", Embarked),
+         Embarked = as.factor(Embarked))
+
+# predict the model
+pred_best <- predict(model_c50, new_data = titanic_test, type = "class") |> 
+  bind_cols(titanic_test)
+
+submission <- pred_best |> 
+  mutate(Survived = .pred_class) |> 
+  select(Survived, PassengerId)
+
+# csv file
+# write.csv("titanic_test_prediction.csv", row.names = F)
+```
+
